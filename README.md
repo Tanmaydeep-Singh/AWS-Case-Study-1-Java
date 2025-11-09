@@ -77,77 +77,175 @@ If you prefer Node.js 22 runtime, use the following code:
    ![Screensot Diagram](./Images/ScreenShot-7.png)
 
 
-```javascript
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
-import { DynamoDBClient, PutItemCommand } from "@aws-sdk/client-dynamodb";
-import { Readable } from "stream";
+```Java
 
-const s3 = new S3Client();
-const dynamo = new DynamoDBClient();
 
-export const handler = async (event) => {
-  console.log("Event received:", JSON.stringify(event));
+   package com;
 
-  try {
-    // 1. Get bucket and key from S3 event
-    const record = event.Records[0];
-    const bucket = record.s3.bucket.name;
-    const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
+import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
+import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
+import com.amazonaws.services.dynamodbv2.model.AttributeValue;
+import com.amazonaws.services.dynamodbv2.model.PutItemRequest;
+import com.amazonaws.services.lambda.runtime.Context;
+import com.amazonaws.services.lambda.runtime.RequestHandler;
+import com.amazonaws.services.lambda.runtime.events.S3Event;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.AmazonS3ClientBuilder;
+import com.amazonaws.services.s3.model.S3Object;
 
-    console.log(`Processing file: ${key} from bucket: ${bucket}`);
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.time.Instant;
 
-    // 2. Get file content from S3
-    const getObjectCommand = new GetObjectCommand({ Bucket: bucket, Key: key });
-    const response = await s3.send(getObjectCommand);
+public class S3FileProcessorHandler implements RequestHandler<S3Event, String> {
 
-    // Convert stream to text
-    const streamToString = (stream) =>
-      new Promise((resolve, reject) => {
-        const chunks = [];
-        stream.on("data", (chunk) => chunks.push(chunk));
-        stream.on("error", reject);
-        stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-      });
+    private final AmazonS3 s3Client = AmazonS3ClientBuilder.standard().build();
+    private final AmazonDynamoDB dynamoClient = AmazonDynamoDBClientBuilder.standard().build();
 
-    const fileContent = await streamToString(response.Body);
+    @Override
+    public String handleRequest(S3Event event, Context context) {
+        context.getLogger().log("Event received: " + event.toString());
 
-    // 3. Process text: count lines, words, characters
-    const lineCount = fileContent.split(/\r?\n/).length;
-    const wordCount = fileContent.trim().split(/\s+/).length;
-    const charCount = fileContent.length;
-    const preview = fileContent.slice(0, 100);
+        try {
+            if (event.getRecords() == null || event.getRecords().isEmpty()) {
+                context.getLogger().log("⚠️ No S3 records found in event.\n");
+                return "{\"message\": \"No records to process.\"}";
+            }
 
-    // 4. Store results in DynamoDB
-    const putItemCommand = new PutItemCommand({
-      TableName: "FileProcessingResults",
-      Item: {
-        fileName: { S: key },
-        lineCount: { N: lineCount.toString() },
-        wordCount: { N: wordCount.toString() },
-        charCount: { N: charCount.toString() },
-        preview: { S: preview },
-        processedAt: { S: new Date().toISOString() },
-      },
-    });
+            // 1️⃣ Get S3 bucket and key from event
+            String bucket = event.getRecords().get(0).getS3().getBucket().getName();
+            String key = event.getRecords().get(0).getS3().getObject().getKey();
+            key = java.net.URLDecoder.decode(key.replace("+", " "), StandardCharsets.UTF_8);
 
-    await dynamo.send(putItemCommand);
-    console.log("Data saved to DynamoDB successfully.");
+            context.getLogger().log("Processing file: " + key + " from bucket: " + bucket);
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
-        message: "File processed successfully",
-        fileName: key,
-        lineCount,
-        wordCount,
-        charCount,
-      }),
-    };
-  } catch (error) {
-    console.error("Error processing file:", error);
-    throw error;
-  }
-};
+            // 2️⃣ Read file content from S3
+            S3Object s3Object = s3Client.getObject(bucket, key);
+            BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(s3Object.getObjectContent(), StandardCharsets.UTF_8));
+
+            StringBuilder contentBuilder = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                contentBuilder.append(line).append("\n");
+            }
+
+            String fileContent = contentBuilder.toString();
+
+            // 3️⃣ Process text: count lines, words, and characters
+            int lineCount = fileContent.split("\\r?\\n").length;
+            int wordCount = fileContent.trim().isEmpty() ? 0 : fileContent.trim().split("\\s+").length;
+            int charCount = fileContent.length();
+            String preview = fileContent.length() > 100 ? fileContent.substring(0, 100) : fileContent;
+
+            // 4️⃣ Save results into DynamoDB
+            Map<String, AttributeValue> item = new HashMap<>();
+            item.put("fileName", new AttributeValue(key));
+            item.put("lineCount", new AttributeValue().withN(Integer.toString(lineCount)));
+            item.put("wordCount", new AttributeValue().withN(Integer.toString(wordCount)));
+            item.put("charCount", new AttributeValue().withN(Integer.toString(charCount)));
+            item.put("preview", new AttributeValue(preview));
+            item.put("processedAt", new AttributeValue(Instant.now().toString()));
+
+            PutItemRequest request = new PutItemRequest()
+                    .withTableName("FileProcessingResults")
+                    .withItem(item);
+
+            dynamoClient.putItem(request);
+            context.getLogger().log("✅ Data saved to DynamoDB successfully.");
+
+            // 5️⃣ Return success response
+            return String.format(
+                    "{ \"message\": \"File processed successfully\", \"fileName\": \"%s\", \"lineCount\": %d, \"wordCount\": %d, \"charCount\": %d }",
+                    key, lineCount, wordCount, charCount);
+
+        } catch (Exception e) {
+            context.getLogger().log("❌ Error processing file: " + e.getMessage());
+            throw new RuntimeException(e);
+        }
+    }
+}
+
+
+```
+
+```pom.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com</groupId>
+    <artifactId>fileprocessor</artifactId>
+    <version>1.0-SNAPSHOT</version>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+    </properties>
+
+    <dependencies>
+        <!-- AWS Lambda Core -->
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-lambda-java-core</artifactId>
+            <version>1.2.3</version>
+        </dependency>
+
+        <!-- AWS Lambda Events -->
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-lambda-java-events</artifactId>
+            <version>3.11.2</version>
+        </dependency>
+
+        <!-- AWS SDK for S3 -->
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-java-sdk-s3</artifactId>
+            <version>1.12.774</version>
+        </dependency>
+
+        <!-- AWS SDK for DynamoDB -->
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-java-sdk-dynamodb</artifactId>
+            <version>1.12.774</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.3.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <transformers>
+                                <transformer
+                                    implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.example.S3FileProcessorHandler</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+
+</project>
 
 ```
 ### **Step 5: Test the Setup**
